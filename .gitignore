@@ -1,0 +1,45 @@
+# Build outputs
+*.o
+*.a
+*.so
+*.ko
+*.bin
+*.elf
+
+# Local executable outputs used by Hi3516 samples
+sample_venc
+sample_mp4
+sample_rtsp
+sample_rtsp_mp4
+mpu6050_i2c_test
+
+# Runtime media/log outputs
+*.h264
+*.h265
+*.mp4
+*.log
+*.pid
+
+# Local SDK/rootfs/archive material
+/linux-5.10.221/
+/system/
+/system.tgz
+/rtsp.tgz
+/codex-temp/
+/_remote_*/
+/_tmp_*.sh
+
+# Local historical working copies.
+# The tracked main program lives in /app; old versions are kept by git commits/tags.
+/venc/
+/venc_mp4/
+/venc_rtsp/
+/venc_rtsp_mp4/
+/venc_rtsp_mp4 v2/
+/venc_rtsp_mp4_gyro/
+/venc_rtsp_mp4_onvif/
+/mpu6050_i2c_test/
+/nfs_share/
+
+# Dependencies are provided by the remote Linux build environment.
+/rtsp/
