@@ -17,6 +17,7 @@ td_bool sample_mp4_muxer_is_supported(ot_payload_type payload);
 td_s32 sample_mp4_muxer_open(sample_mp4_muxer **muxer, const td_char *file_name,
     ot_payload_type payload, td_u32 width, td_u32 height, td_u32 frame_rate);
 td_s32 sample_mp4_muxer_write_stream(sample_mp4_muxer *muxer, const ot_venc_stream *stream);
+td_bool sample_mp4_muxer_stream_is_key_frame(ot_payload_type payload, const ot_venc_stream *stream);
 td_void sample_mp4_muxer_close(sample_mp4_muxer *muxer);
 
 #ifdef __cplusplus

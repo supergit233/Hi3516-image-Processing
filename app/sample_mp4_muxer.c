@@ -858,6 +858,120 @@ td_bool sample_mp4_muxer_is_supported(ot_payload_type payload)
     return (payload == OT_PT_H264 || payload == OT_PT_H265) ? TD_TRUE : TD_FALSE;
 }
 
+static td_bool sample_mp4_nalu_is_key_frame(ot_payload_type payload, const td_u8 *nalu, td_u32 len)
+{
+    td_u8 nalu_type;
+
+    if (payload == OT_PT_H264) {
+        if (nalu == TD_NULL || len < 1) {
+            return TD_FALSE;
+        }
+        nalu_type = nalu[0] & 0x1f;
+        return (nalu_type == OT_VENC_H264_NALU_IDR_SLICE) ? TD_TRUE : TD_FALSE;
+    }
+
+    if (payload == OT_PT_H265) {
+        if (nalu == TD_NULL || len < 2) { /* 2: h265 nalu header len */
+            return TD_FALSE;
+        }
+        nalu_type = (nalu[0] >> 1) & 0x3f;
+        if (nalu_type == OT_VENC_H265_NALU_IDR_SLICE || nalu_type == 20 || nalu_type == SAMPLE_MP4_H265_NALU_CRA) {
+            return TD_TRUE;
+        }
+    }
+
+    return TD_FALSE;
+}
+
+static td_bool sample_mp4_annexb_has_key_frame(ot_payload_type payload, const td_u8 *data, td_u32 len)
+{
+    td_u32 start = 0;
+    td_u32 start_code_len = 0;
+    td_u32 search_from;
+    td_u32 next_start = 0;
+    td_u32 next_start_code_len = 0;
+    td_u32 nalu_start;
+    td_u32 nalu_end;
+
+    if (data == TD_NULL || len == 0) {
+        return TD_FALSE;
+    }
+
+    if (sample_mp4_find_start_code(data, len, 0, &start, &start_code_len) != TD_TRUE) {
+        return sample_mp4_nalu_is_key_frame(payload, data, len);
+    }
+
+    search_from = start + start_code_len;
+    while (search_from < len) {
+        nalu_start = search_from;
+        if (sample_mp4_find_start_code(data, len, search_from, &next_start, &next_start_code_len) == TD_TRUE) {
+            nalu_end = next_start;
+        } else {
+            nalu_end = len;
+        }
+
+        if (nalu_end > nalu_start && sample_mp4_nalu_is_key_frame(payload, data + nalu_start,
+            nalu_end - nalu_start) == TD_TRUE) {
+            return TD_TRUE;
+        }
+
+        if (nalu_end == len) {
+            break;
+        }
+        search_from = next_start + next_start_code_len;
+    }
+
+    return TD_FALSE;
+}
+
+td_bool sample_mp4_muxer_stream_is_key_frame(ot_payload_type payload, const ot_venc_stream *stream)
+{
+    td_u32 i;
+    td_u32 frame_len = 0;
+    td_u32 copy_pos = 0;
+    td_u32 pack_len;
+    td_u8 *frame = TD_NULL;
+    td_bool key_frame;
+
+    if (sample_mp4_muxer_is_supported(payload) != TD_TRUE ||
+        stream == TD_NULL || stream->pack == TD_NULL) {
+        return TD_FALSE;
+    }
+
+    for (i = 0; i < stream->pack_cnt; i++) {
+        if (stream->pack[i].len <= stream->pack[i].offset) {
+            continue;
+        }
+        pack_len = stream->pack[i].len - stream->pack[i].offset;
+        if (pack_len > 0xffffffffU - frame_len) {
+            return TD_FALSE;
+        }
+        frame_len += pack_len;
+    }
+
+    if (frame_len == 0) {
+        return TD_FALSE;
+    }
+
+    frame = (td_u8 *)malloc(frame_len);
+    if (frame == TD_NULL) {
+        return TD_FALSE;
+    }
+
+    for (i = 0; i < stream->pack_cnt; i++) {
+        if (stream->pack[i].len <= stream->pack[i].offset) {
+            continue;
+        }
+        pack_len = stream->pack[i].len - stream->pack[i].offset;
+        (td_void)memcpy(frame + copy_pos, stream->pack[i].addr + stream->pack[i].offset, pack_len);
+        copy_pos += pack_len;
+    }
+
+    key_frame = sample_mp4_annexb_has_key_frame(payload, frame, frame_len);
+    free(frame);
+    return key_frame;
+}
+
 td_s32 sample_mp4_muxer_open(sample_mp4_muxer **muxer, const td_char *file_name,
     ot_payload_type payload, td_u32 width, td_u32 height, td_u32 frame_rate)
 {
