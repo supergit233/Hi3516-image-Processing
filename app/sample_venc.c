@@ -8,9 +8,13 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <signal.h>
+#include <errno.h>
+#include <sys/prctl.h>
+#include <sys/select.h>
 
 #include "sample_comm.h"
 #include "sample_ipc.h"
+#include "sample_mp4_muxer.h"
 #include "securec.h"
 
 #define BIG_STREAM_SIZE PIC_2560X1440
@@ -67,6 +71,17 @@ typedef struct {
 static td_bool g_sample_venc_exit = TD_FALSE;
 static td_bool g_send_multi_frame_signal = TD_FALSE;
 static pthread_t g_send_multi_frame_thread = 0;
+
+typedef struct {
+    td_bool thread_start;
+    td_s32 cnt;
+    ot_venc_chn venc_chn[OT_VENC_MAX_CHN_NUM];
+    td_s32 venc_fd[OT_VENC_MAX_CHN_NUM];
+    sample_mp4_muxer *muxer[OT_VENC_MAX_CHN_NUM];
+} sample_venc_mp4_getstream_para;
+
+static sample_venc_mp4_getstream_para g_sample_venc_mp4_para = {0};
+static pthread_t g_sample_venc_mp4_pid = 0;
 
 /* *****************************************************************************
  * function : show usage
@@ -795,6 +810,214 @@ static td_void sample_venc_stop(const sample_venc_vpss_chn *venc_vpss_chn, td_s3
     }
 }
 
+static td_void sample_venc_mp4_close_muxer(sample_venc_mp4_getstream_para *para)
+{
+    td_s32 i;
+
+    for (i = 0; i < para->cnt && i < OT_VENC_MAX_CHN_NUM; i++) {
+        if (para->muxer[i] != TD_NULL) {
+            sample_mp4_muxer_close(para->muxer[i]);
+            para->muxer[i] = TD_NULL;
+        }
+    }
+}
+
+static td_s32 sample_venc_mp4_open_muxer(sample_venc_mp4_getstream_para *para, td_s32 index)
+{
+    td_s32 ret;
+    td_char file_name[64]; /* 64: file name len */
+    ot_venc_chn venc_chn = para->venc_chn[index];
+    ot_venc_chn_attr venc_chn_attr;
+
+    ret = ss_mpi_venc_get_chn_attr(venc_chn, &venc_chn_attr);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_get_chn_attr chn[%d] failed with %#x!\n", venc_chn, ret);
+        return TD_FAILURE;
+    }
+    if (sample_mp4_muxer_is_supported(venc_chn_attr.venc_attr.type) != TD_TRUE) {
+        sample_print("chn[%d] payload %d is not supported by mp4 muxer\n", venc_chn, venc_chn_attr.venc_attr.type);
+        return TD_FAILURE;
+    }
+
+    if (snprintf_s(file_name, sizeof(file_name), sizeof(file_name) - 1,
+        "stream_chn%d.mp4", venc_chn) < 0) {
+        return TD_FAILURE;
+    }
+
+    ret = sample_mp4_muxer_open(&para->muxer[index], file_name, venc_chn_attr.venc_attr.type,
+        venc_chn_attr.venc_attr.pic_width, venc_chn_attr.venc_attr.pic_height, 30); /* 30: venc fps */
+    if (ret != TD_SUCCESS) {
+        sample_print("open mp4 file[%s] failed!\n", file_name);
+        return TD_FAILURE;
+    }
+
+    para->venc_fd[index] = ss_mpi_venc_get_fd(venc_chn);
+    if (para->venc_fd[index] < 0) {
+        sample_print("ss_mpi_venc_get_fd chn[%d] failed with %#x!\n", venc_chn, para->venc_fd[index]);
+        return TD_FAILURE;
+    }
+
+    printf("chn[%d] save mp4 file: %s\n", venc_chn, file_name);
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_venc_mp4_get_stream_from_one_chn(sample_venc_mp4_getstream_para *para, td_s32 index)
+{
+    td_s32 ret;
+    ot_venc_stream stream;
+    ot_venc_chn_status stat;
+    ot_venc_chn venc_chn = para->venc_chn[index];
+
+    if (memset_s(&stream, sizeof(stream), 0, sizeof(stream)) != EOK) {
+        sample_print("memset stream failed\n");
+        return TD_FAILURE;
+    }
+
+    ret = ss_mpi_venc_query_status(venc_chn, &stat);
+    if (ret != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_query_status chn[%d] failed with %#x!\n", venc_chn, ret);
+        return TD_FAILURE;
+    }
+
+    if (stat.cur_packs == 0) {
+        return TD_SUCCESS;
+    }
+
+    stream.pack = (ot_venc_pack *)malloc(sizeof(ot_venc_pack) * stat.cur_packs);
+    if (stream.pack == TD_NULL) {
+        sample_print("malloc stream pack failed!\n");
+        return TD_FAILURE;
+    }
+
+    stream.pack_cnt = stat.cur_packs;
+    ret = ss_mpi_venc_get_stream(venc_chn, &stream, TD_TRUE);
+    if (ret != TD_SUCCESS) {
+        free(stream.pack);
+        stream.pack = TD_NULL;
+        sample_print("ss_mpi_venc_get_stream chn[%d] failed with %#x!\n", venc_chn, ret);
+        return TD_FAILURE;
+    }
+
+    ret = sample_mp4_muxer_write_stream(para->muxer[index], &stream);
+    if (ret != TD_SUCCESS) {
+        sample_print("write chn[%d] mp4 stream failed!\n", venc_chn);
+    }
+
+    if (ss_mpi_venc_release_stream(venc_chn, &stream) != TD_SUCCESS) {
+        sample_print("ss_mpi_venc_release_stream chn[%d] failed!\n", venc_chn);
+        ret = TD_FAILURE;
+    }
+
+    free(stream.pack);
+    stream.pack = TD_NULL;
+    return ret;
+}
+
+static td_void *sample_venc_mp4_get_stream_proc(td_void *p)
+{
+    td_s32 i;
+    td_s32 ret;
+    td_s32 max_fd;
+    fd_set read_fds;
+    struct timeval timeout_val;
+    sample_venc_mp4_getstream_para *para = (sample_venc_mp4_getstream_para *)p;
+
+    prctl(PR_SET_NAME, "get_mp4_stream", 0, 0, 0);
+
+    while (para->thread_start == TD_TRUE) {
+        FD_ZERO(&read_fds);
+        max_fd = -1;
+        for (i = 0; i < para->cnt && i < OT_VENC_MAX_CHN_NUM; i++) {
+            FD_SET(para->venc_fd[i], &read_fds);
+            if (max_fd < para->venc_fd[i]) {
+                max_fd = para->venc_fd[i];
+            }
+        }
+
+        timeout_val.tv_sec = 2; /* 2: timeout seconds */
+        timeout_val.tv_usec = 0;
+        ret = select(max_fd + 1, &read_fds, TD_NULL, TD_NULL, &timeout_val);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            sample_print("select mp4 stream failed!\n");
+            break;
+        } else if (ret == 0) {
+            continue;
+        }
+
+        for (i = 0; i < para->cnt && i < OT_VENC_MAX_CHN_NUM; i++) {
+            if (FD_ISSET(para->venc_fd[i], &read_fds)) {
+                if (sample_venc_mp4_get_stream_from_one_chn(para, i) != TD_SUCCESS) {
+                    para->thread_start = TD_FALSE;
+                    break;
+                }
+            }
+        }
+    }
+
+    sample_venc_mp4_close_muxer(para);
+    para->thread_start = TD_FALSE;
+    return TD_NULL;
+}
+
+static td_s32 sample_venc_start_get_mp4_stream(ot_venc_chn *venc_chn, td_s32 cnt)
+{
+    td_s32 i;
+    td_s32 ret;
+
+    if (venc_chn == TD_NULL || cnt <= 0 || cnt > OT_VENC_MAX_CHN_NUM) {
+        return TD_FAILURE;
+    }
+
+    if (memset_s(&g_sample_venc_mp4_para, sizeof(g_sample_venc_mp4_para), 0,
+        sizeof(g_sample_venc_mp4_para)) != EOK) {
+        return TD_FAILURE;
+    }
+    g_sample_venc_mp4_para.cnt = cnt;
+    for (i = 0; i < cnt && i < OT_VENC_MAX_CHN_NUM; i++) {
+        g_sample_venc_mp4_para.venc_chn[i] = venc_chn[i];
+        if (sample_venc_mp4_open_muxer(&g_sample_venc_mp4_para, i) != TD_SUCCESS) {
+            sample_venc_mp4_close_muxer(&g_sample_venc_mp4_para);
+            return TD_FAILURE;
+        }
+    }
+
+    g_sample_venc_mp4_para.thread_start = TD_TRUE;
+    ret = pthread_create(&g_sample_venc_mp4_pid, 0, sample_venc_mp4_get_stream_proc,
+        (td_void *)&g_sample_venc_mp4_para);
+    if (ret != 0) {
+        g_sample_venc_mp4_para.thread_start = TD_FALSE;
+        sample_venc_mp4_close_muxer(&g_sample_venc_mp4_para);
+        sample_print("create mp4 get stream thread failed, ret %d\n", ret);
+        return TD_FAILURE;
+    }
+
+    return TD_SUCCESS;
+}
+
+static td_s32 sample_venc_stop_get_mp4_stream(const ot_venc_chn *venc_chn, td_s32 cnt)
+{
+    td_s32 i;
+    td_s32 ret = TD_SUCCESS;
+
+    if (g_sample_venc_mp4_pid != 0) {
+        g_sample_venc_mp4_para.thread_start = TD_FALSE;
+        pthread_join(g_sample_venc_mp4_pid, 0);
+        g_sample_venc_mp4_pid = 0;
+    }
+
+    for (i = 0; i < cnt; i++) {
+        if (ss_mpi_venc_stop_chn(venc_chn[i]) != TD_SUCCESS) {
+            sample_print("chn %d ss_mpi_venc_stop_recv_pic failed!\n", venc_chn[i]);
+            ret = TD_FAILURE;
+        }
+    }
+
+    return ret;
+}
+
 static td_s32 sample_venc_normal_start_encode(ot_size *enc_size, ot_vpss_grp vpss_grp,
     sample_venc_vpss_chn *venc_vpss_chn)
 {
@@ -844,7 +1067,7 @@ static td_s32 sample_venc_normal_start_encode(ot_size *enc_size, ot_vpss_grp vps
     /* *****************************************
      stream save process
     ***************************************** */
-    if ((ret = sample_comm_venc_start_get_stream(venc_vpss_chn->venc_chn, CHN_NUM_MAX)) != TD_SUCCESS) {
+    if ((ret = sample_venc_start_get_mp4_stream(venc_vpss_chn->venc_chn, CHN_NUM_MAX)) != TD_SUCCESS) {
         sample_print("Start Venc failed!\n");
         goto EXIT_VENC_H264_UnBind;
     }
@@ -872,6 +1095,17 @@ static td_void sample_venc_exit_process()
         (td_void)getchar();
     }
     sample_comm_venc_stop_get_stream(CHN_NUM_MAX);
+}
+
+static td_void sample_venc_mp4_exit_process(const sample_venc_vpss_chn *venc_vpss_chn)
+{
+    printf("please press twice ENTER to exit this sample\n");
+    (td_void)getchar();
+
+    if (g_sample_venc_exit != TD_TRUE) {
+        (td_void)getchar();
+    }
+    (td_void)sample_venc_stop_get_mp4_stream(venc_vpss_chn->venc_chn, CHN_NUM_MAX);
 }
 
 static td_void sample_venc_mosaic_map_exit_process(td_s32 chn_num_max)
@@ -1179,7 +1413,7 @@ static td_s32 sample_venc_normal(td_void)
     /* *****************************************
      exit process
     ***************************************** */
-    sample_venc_exit_process();
+    sample_venc_mp4_exit_process(&venc_vpss_chn);
     sample_venc_unbind_vpss_stop(vpss_grp, &venc_vpss_chn);
 
 EXIT_SYS_VI_VPSS:

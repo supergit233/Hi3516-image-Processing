@@ -1,8 +1,8 @@
 
 include ../Makefile.param
 
-SMP_SRCS := $(wildcard *.c)
-TARGET := $(SMP_SRCS:%.c=%)
+SMP_SRCS := sample_venc.c sample_mp4_muxer.c
+TARGET := sample_venc
 
 TARGET_PATH := $(PWD)
 
